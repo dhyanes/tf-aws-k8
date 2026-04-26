@@ -1,83 +1,75 @@
-# Kubernetes on AWS — Terraform
+# Kubernetes on AWS — Modular Terraform
 
-Provisions a self-managed Kubernetes cluster on AWS EC2:
-- **1 Master node** (control plane, kubeadm bootstrapped)
-- **2 Worker nodes** (joins automatically via token)
-- **Flannel** as the CNI plugin
-- Ubuntu 22.04 LTS base image
-- Kubernetes **v1.29**
+Self-managed Kubernetes cluster (1 master + 2 workers) with fully reusable modules
+and separate configs for **dev**, **staging**, and **prod**.
 
-## Architecture
+## Repository Structure
 
 ```
-Internet
-    │
-    ▼
-  IGW
-    │
-  VPC (10.0.0.0/16)
-    │
-  Public Subnet (10.0.1.0/24)
-    ├── master   (t3.medium) ← SG: 6443, 22, etcd, kubelet
-    ├── worker-1 (t3.medium) ← SG: 22, 10250, 30000-32767
-    └── worker-2 (t3.medium) ← SG: 22, 10250, 30000-32767
+k8s-terraform/
+├── modules/
+│   ├── vpc/                  # VPC, IGW, subnet, route table
+│   ├── security-groups/      # Master + worker SGs
+│   ├── iam/                  # IAM roles & instance profiles
+│   └── compute/              # Key pair, master EC2, worker EC2s
+│       └── scripts/
+│           ├── master.sh     # kubeadm init + Flannel CNI
+│           └── worker.sh     # kubeadm join
+└── environments/
+    ├── dev/                  # t3.small workers, no encryption, open SSH
+    ├── staging/              # t3.medium, encrypted volumes, IP-restricted SSH
+    └── prod/                 # t3.large, encrypted volumes, locked CIDR, bigger disks
 ```
 
-## Prerequisites
+## Environment Comparison
 
-- Terraform >= 1.3
-- AWS CLI configured (`aws configure`)
-- An SSH key pair
+| Setting              | dev         | staging     | prod        |
+|----------------------|-------------|-------------|-------------|
+| Master instance      | t3.medium   | t3.medium   | t3.large    |
+| Worker instance      | t3.small    | t3.medium   | t3.large    |
+| Worker count         | 2           | 2           | 2           |
+| Master disk (GB)     | 20          | 30          | 50          |
+| Worker disk (GB)     | 15          | 20          | 40          |
+| EBS encryption       | ✗           | ✓           | ✓           |
+| VPC CIDR             | 10.10.0.0/16| 10.20.0.0/16| 10.30.0.0/16|
+| admin_cidr default   | 0.0.0.0/0   | explicit IP | explicit IP |
 
 ## Quick Start
 
 ```bash
-# 1. Clone / download this directory
-cd k8s-aws/
+# Pick an environment
+cd environments/dev    # or staging / prod
 
-# 2. Copy and fill in your variables
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars — add your SSH public key and IP
+# Fill in your values
+cp terraform.tfvars terraform.tfvars.local
+# Edit: set public_key_material and admin_cidr
 
-# 3. Initialize and apply
+# Deploy
 terraform init
-terraform plan
-terraform apply
+terraform plan -var-file="terraform.tfvars"
+terraform apply -var-file="terraform.tfvars"
 ```
 
 ## After Apply
 
 ```bash
-# SSH to master
-ssh -i ~/.ssh/id_rsa ubuntu@<master_public_ip>
+# Outputs give you ready-to-use commands:
+terraform output ssh_master
+terraform output kubeconfig_cmd
 
-# Check nodes (takes ~3-5 minutes to fully initialize)
+# Check nodes (~3-5 min after apply)
 kubectl get nodes
-
-# Copy kubeconfig to your local machine
-scp -i ~/.ssh/id_rsa ubuntu@<master_public_ip>:/home/ubuntu/.kube/config ~/.kube/config
-kubectl get nodes   # from your local machine
 ```
 
-## Manual Worker Join (fallback)
+## Remote State (Recommended for staging/prod)
 
-If the worker's auto-join fails, SSH to master and regenerate the token:
-
-```bash
-# On master
-kubeadm token create --print-join-command
-
-# Copy the output and run it on the worker node with sudo
-```
+Uncomment the `backend "s3"` block in each environment's `main.tf` and create:
+- An S3 bucket for state files
+- A DynamoDB table (`tf-lock`) for state locking
 
 ## Tear Down
 
 ```bash
+cd environments/dev
 terraform destroy
 ```
-
-## Notes
-
-- **SSH between nodes**: The worker bootstrap script fetches the join token via SSH from master. Ensure your SSH key is available. For production, use AWS SSM Parameter Store or Secrets Manager instead.
-- **Production hardening**: Use private subnets + NAT gateway, restrict `admin_cidr`, enable CloudTrail, and consider EKS for managed control plane.
-- **Instance sizing**: `t3.medium` is the minimum. Use `t3.large` or `m5.large` for real workloads.
